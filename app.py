@@ -1,393 +1,974 @@
 import os
-import uuid
 import html
 import logging
+import uuid
+from typing import Any, Dict, List, Optional
+
 import requests
-from typing import Dict, List, Optional
+import streamlit as st
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import streamlit as st
 
-logging.basicConfig(
-level=logging.INFO,
-format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("Trivio-Magdy-UI")
+
+# ============================================================
+# Configuration
+# ============================================================
+
+APP_NAME = "TRIVIO"
+AGENT_NAME = "عم مجدي"
 
 API_TIMEOUT = 90
 MAX_RETRIES = 3
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("trivio-ui")
+
+
 st.set_page_config(
-page_title="Trivio | عم مجدي - Football AI",
-page_icon="⚽",
-layout="wide",
-initial_sidebar_state="expanded",
+    page_title="Trivio | عم مجدي",
+    page_icon="⚽",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-try:
-CHAT_ENDPOINT = st.secrets.get("CHAT_ENDPOINT", "")
-except FileNotFoundError:
-CHAT_ENDPOINT = os.getenv("CHAT_ENDPOINT", "")
 
-@st.cache_resource
+# ============================================================
+# App helpers
+# ============================================================
+
+def get_chat_endpoint() -> str:
+    """Read the backend URL from Streamlit secrets or environment."""
+    try:
+        endpoint = st.secrets.get("CHAT_ENDPOINT")
+        if endpoint:
+            return str(endpoint).strip()
+    except Exception:
+        # No secrets file is a valid local-development state.
+        pass
+
+    return os.getenv("CHAT_ENDPOINT", "").strip()
+
+
+CHAT_ENDPOINT = get_chat_endpoint()
+
+
+@st.cache_resource(show_spinner=False)
 def get_api_session() -> requests.Session:
-session = requests.Session()
-retry_strategy = Retry(
-total=MAX_RETRIES,
-backoff_factor=1,
-status_forcelist=[429, 500, 502, 503, 504],
-allowed_methods=["POST", "GET"]
-)
-adapter = HTTPAdapter(max_retries=retry_strategy)
-session.mount("http://", adapter)
-session.mount("https://", adapter)
-return session
+    """Create one reusable HTTP session with sensible retries."""
+    session = requests.Session()
+
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        connect=MAX_RETRIES,
+        read=MAX_RETRIES,
+        status=MAX_RETRIES,
+        backoff_factor=0.8,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"POST"}),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=10,
+        pool_maxsize=10,
+    )
+
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(
+        {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Trivio-Magdy-Streamlit/2.0",
+        }
+    )
+
+    return session
+
 
 def ask_backend(session_id: str, message: str) -> str:
-session = get_api_session()
-payload = {"id": session_id, "message": message}
+    """Send a message to the FastAPI agent and return its answer."""
+    payload = {
+        "id": session_id,
+        "message": message,
+    }
 
-logger.info(f"Sending prompt to Magdy API for session: {session_id[:8]}...")
+    logger.info(
+        "Sending request to Magdy API | session=%s",
+        session_id[:8],
+    )
 
-response = session.post(
-    url=CHAT_ENDPOINT,
-    json=payload,
-    timeout=API_TIMEOUT
-)
-response.raise_for_status()
+    response = get_api_session().post(
+        CHAT_ENDPOINT,
+        json=payload,
+        timeout=(10, API_TIMEOUT),
+    )
 
-data = response.json()
-if "message" not in data:
-    logger.error("API response missing 'message' key.")
-    raise ValueError("Invalid response format from backend.")
-    
-return str(data["message"])
+    response.raise_for_status()
 
-def initialize_session():
-if "session_id" not in st.session_state:
-st.session_state.session_id = str(uuid.uuid4())
-logger.info(f"New session initialized: {st.session_state.session_id}")
+    try:
+        data: Any = response.json()
+    except ValueError as exc:
+        raise ValueError("Backend returned invalid JSON.") from exc
 
-if "messages" not in st.session_state:
+    if isinstance(data, dict):
+        message_value = data.get("message")
+
+        if message_value is None:
+            raise ValueError("Backend response does not contain 'message'.")
+
+        return str(message_value).strip()
+
+    if isinstance(data, str):
+        return data.strip()
+
+    raise ValueError("Unexpected backend response format.")
+
+
+def initialize_state() -> None:
+    """Initialize all session-state values once."""
+    defaults = {
+        "session_id": str(uuid.uuid4()),
+        "messages": [],
+        "pending_question": None,
+    }
+
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_conversation() -> None:
+    """Start a completely fresh agent conversation."""
+    st.session_state.session_id = str(uuid.uuid4())
     st.session_state.messages = []
-    
-if "pending_question" not in st.session_state:
     st.session_state.pending_question = None
+    st.toast("بدأنا محادثة جديدة ⚽", icon="🔄")
 
-def reset_conversation():
-st.session_state.session_id = str(uuid.uuid4())
-st.session_state.messages = []
-st.session_state.pending_question = None
-st.toast("تم بدء محادثة جديدة بنجاح!", icon="🔄")
-logger.info("Conversation reset by user.")
 
-def inject_custom_css():
-st.markdown(
-"""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&display=swap');
+def queue_question(question: str) -> None:
+    """Queue a suggested question for the main chat loop."""
+    st.session_state.pending_question = question
+    st.rerun()
 
-    html, body, [class*="css"] { font-family: 'Cairo', sans-serif !important; }
-    body { background: #06100b; }
-    
-    .stApp {
-        background: radial-gradient(circle at 50% -15%, rgba(25, 170, 100, 0.14), transparent 34%), #06100b;
-        color: #edf5f0;
-    }
 
-    #MainMenu, footer, header { visibility: hidden; }
-    .block-container { max-width: 1100px; padding-top: 1.2rem; padding-bottom: 6rem; }
+# ============================================================
+# Styling
+# ============================================================
 
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #08150e 0%, #06100b 100%);
-        border-left: 1px solid rgba(255,255,255,0.045);
-    }
-    [data-testid="stSidebar"] > div:first-child { padding-top: 1.3rem; }
-    .sidebar-brand { display: flex; align-items: center; gap: 12px; padding: 4px 8px 26px; direction: ltr; }
-    .sidebar-logo {
-        width: 44px; height: 44px; min-width: 44px; border-radius: 14px;
-        display: flex; align-items: center; justify-content: center;
-        background: linear-gradient(145deg, #19b36b, #087440);
-        box-shadow: 0 10px 30px rgba(18, 170, 99, 0.20); font-size: 21px;
-    }
-    .sidebar-brand-title { color: #ffffff; font-size: 18px; font-weight: 800; line-height: 1.1; }
-    .sidebar-brand-subtitle { color: #6f8378; font-size: 10px; margin-top: 4px; letter-spacing: 0.3px; }
-    
-    .sidebar-label { color: #63776c; font-size: 10px; font-weight: 700; letter-spacing: 0.7px; margin: 22px 8px 9px; direction: rtl; text-align: right; }
-    .sidebar-description {
-        margin: 20px 4px 0; padding: 15px; border-radius: 15px; background: rgba(255,255,255,0.025);
-        border: 1px solid rgba(255,255,255,0.05); color: #81948a; font-size: 11px; line-height: 1.9; text-align: right; direction: rtl;
-    }
+def inject_css() -> None:
+    """Modern dark football-themed UI with Arabic RTL support."""
+    st.markdown(
+        """
+        <style>
+        @import url(
+            'https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&display=swap'
+        );
 
-    .stButton > button {
-        min-height: 42px; border-radius: 12px !important; border: 1px solid rgba(255,255,255,0.055) !important;
-        background: rgba(255,255,255,0.025) !important; color: #b8c8bf !important;
-        font-weight: 500 !important; transition: all 0.2s ease;
-    }
-    .stButton > button:hover {
-        background: rgba(22,165,96,0.09) !important; border-color: rgba(22,165,96,0.22) !important;
-        color: #ffffff !important; transform: translateY(-1px);
-    }
-    .new-chat button {
-        background: linear-gradient(135deg, #16a562, #087440) !important; color: #ffffff !important;
-        border: none !important; font-weight: 700 !important; box-shadow: 0 8px 24px rgba(17,160,92,0.16);
-    }
+        :root {
+            --bg: #06100b;
+            --surface: #0b1811;
+            --surface-2: #0f2017;
+            --surface-3: #13281c;
+            --border: rgba(255, 255, 255, 0.07);
+            --border-green: rgba(35, 203, 121, 0.22);
+            --text: #edf7f1;
+            --muted: #82978b;
+            --muted-2: #5d7065;
+            --green: #20c778;
+            --green-dark: #087542;
+            --shadow: 0 20px 55px rgba(0, 0, 0, 0.28);
+        }
 
-    .topbar { display: flex; align-items: center; justify-content: space-between; padding: 4px 2px 20px; direction: rtl; }
-    .profile { display: flex; align-items: center; gap: 12px; direction: ltr; }
-    .profile-avatar {
-        width: 46px; height: 46px; min-width: 46px; border-radius: 15px; display: flex; align-items: center; justify-content: center;
-        background: linear-gradient(145deg, #1ab36c, #087440); font-size: 24px; box-shadow: 0 8px 25px rgba(0,0,0,0.28);
-    }
-    .profile-name { color: #ffffff; font-size: 18px; font-weight: 800; line-height: 1.1; text-align: right; }
-    .profile-role { color: #71867b; font-size: 10px; margin-top: 4px; text-align: right; }
-    .status {
-        display: flex; align-items: center; gap: 7px; padding: 6px 11px; border-radius: 999px;
-        background: rgba(23,168,101,0.07); border: 1px solid rgba(23,168,101,0.14); color: #6bd39c; font-size: 10px; font-weight: 600;
-    }
-    .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #31d47e; box-shadow: 0 0 8px rgba(49,212,126,0.65); }
+        * {
+            box-sizing: border-box;
+        }
 
-    .welcome { text-align: center; direction: rtl; padding: 42px 15px 28px; }
-    .welcome-icon {
-        width: 76px; height: 76px; margin: auto; display: flex; align-items: center; justify-content: center;
-        border-radius: 24px; background: radial-gradient(circle at 35% 25%, #2bc77b, #087440); font-size: 36px;
-        box-shadow: 0 18px 45px rgba(0,0,0,0.35), 0 0 45px rgba(23,168,101,0.08);
-    }
-    .welcome h1 { color: #ffffff; font-size: 30px; font-weight: 800; margin: 19px 0 7px; }
-    .welcome p { max-width: 560px; margin: auto; color: #84988d; font-size: 13px; line-height: 2; }
-    .quick-heading { color: #667b70; font-size: 10px; font-weight: 700; text-align: right; direction: rtl; margin: 20px 2px 9px; }
+        html,
+        body,
+        [class*="css"] {
+            font-family: "Cairo", sans-serif !important;
+        }
 
-    .chat-area { direction: rtl; margin-top: 8px; }
-    .message-row { display: flex; width: 100%; margin: 18px 0; direction: rtl; }
-    .message-row.user { justify-content: flex-start; }
-    .message-row.assistant { justify-content: flex-end; }
-    .message-container { display: flex; align-items: flex-end; gap: 9px; max-width: 78%; }
-    .message-row.user .message-container { flex-direction: row-reverse; }
-    .message-row.assistant .message-container { flex-direction: row; }
-    
-    .avatar {
-        width: 34px; height: 34px; min-width: 34px; border-radius: 11px; display: flex; align-items: center; justify-content: center; font-size: 16px;
-    }
-    .avatar.user { background: #17251e; border: 1px solid rgba(255,255,255,0.055); }
-    .avatar.assistant { background: linear-gradient(145deg, #18a967, #087440); box-shadow: 0 5px 17px rgba(20,160,92,0.13); }
-    
-    .message-bubble { padding: 11px 15px; font-size: 13px; line-height: 1.95; direction: rtl; text-align: right; word-break: break-word; }
-    .message-row.user .message-bubble {
-        background: #112019; border: 1px solid rgba(255,255,255,0.045); color: #dce8e1; border-radius: 17px 5px 17px 17px;
-    }
-    .message-row.assistant .message-bubble {
-        background: linear-gradient(145deg, rgba(16,38,27,0.96), rgba(9,25,18,0.96));
-        border: 1px solid rgba(23,168,101,0.12); color: #e3ede7; border-radius: 5px 17px 17px 17px;
-    }
+        body {
+            background: var(--bg);
+        }
 
-    .thinking { display: flex; align-items: center; gap: 8px; direction: rtl; color: #71867b; font-size: 11px; padding: 9px 4px; }
-    .thinking-dot { width: 6px; height: 6px; border-radius: 50%; background: #25c777; animation: pulse 1.1s infinite ease-in-out; }
-    @keyframes pulse { 0%, 100% { opacity: .25; transform: scale(.8); } 50% { opacity: 1; transform: scale(1); } }
+        .stApp {
+            min-height: 100vh;
+            color: var(--text);
+            background:
+                radial-gradient(
+                    circle at 50% -10%,
+                    rgba(32, 199, 120, 0.14),
+                    transparent 34%
+                ),
+                radial-gradient(
+                    circle at 0% 100%,
+                    rgba(15, 111, 65, 0.08),
+                    transparent 28%
+                ),
+                var(--bg);
+        }
 
-    div[data-testid="stChatInput"] { direction: rtl; }
-    div[data-testid="stChatInput"] textarea {
-        background: #0b1811 !important; border: 1px solid rgba(255,255,255,0.075) !important; color: #eef5f0 !important;
-        border-radius: 18px !important; font-size: 13px !important; padding: 14px 17px !important; box-shadow: 0 10px 35px rgba(0,0,0,0.18);
-    }
-    div[data-testid="stChatInput"] textarea:focus {
-        border-color: rgba(24,169,103,0.42) !important; box-shadow: 0 0 0 1px rgba(24,169,103,0.12), 0 10px 35px rgba(0,0,0,0.18) !important;
-    }
+        #MainMenu,
+        footer {
+            visibility: hidden;
+        }
 
-    .app-footer { text-align: center; direction: rtl; color: #3f5148; font-size: 9px; margin-top: 30px; padding-bottom: 8px; }
+        header[data-testid="stHeader"] {
+            background: transparent;
+        }
 
-    @media (max-width: 768px) {
-        .block-container { padding: 0.8rem 10px 6rem; }
-        .message-container { max-width: 91%; }
-        .welcome { padding-top: 25px; }
-        .welcome-icon { width: 68px; height: 68px; font-size: 31px; }
-        .welcome h1 { font-size: 25px; }
-        .status { display: none; }
-        .profile-avatar { width: 42px; height: 42px; min-width: 42px; }
-        .message-bubble { font-size: 12px; padding: 10px 13px; }
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+        .block-container {
+            width: 100%;
+            max-width: 1120px;
+            padding-top: 1.25rem;
+            padding-bottom: 7rem;
+        }
 
-def render_message(role: str, content: str):
-safe_message = html.escape(str(content)).replace("\n", "<br>")
+        /* ---------------- Sidebar ---------------- */
 
-if role == "user":
-    avatar, avatar_class, row_class = "👤", "user", "user"
-else:
-    avatar, avatar_class, row_class = "👴", "assistant", "assistant"
+        [data-testid="stSidebar"] {
+            background:
+                linear-gradient(
+                    180deg,
+                    #09170f 0%,
+                    #06100b 100%
+                );
+            border-right: 1px solid var(--border);
+        }
 
-st.markdown(
-    f"""
-    <div class="message-row {row_class}">
-        <div class="message-container">
-            <div class="avatar {avatar_class}">{avatar}</div>
-            <div class="message-bubble">{safe_message}</div>
+        [data-testid="stSidebar"] > div:first-child {
+            padding-top: 1.2rem;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            direction: ltr;
+            padding: 4px 8px 22px;
+        }
+
+        .brand-logo {
+            width: 46px;
+            height: 46px;
+            flex: 0 0 46px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 15px;
+            background:
+                radial-gradient(
+                    circle at 30% 20%,
+                    #39dc8b,
+                    #0a7947 70%
+                );
+            box-shadow:
+                0 12px 30px rgba(23, 185, 108, 0.20);
+            font-size: 22px;
+        }
+
+        .brand-title {
+            color: #ffffff;
+            font-size: 18px;
+            font-weight: 800;
+            letter-spacing: 0.3px;
+            line-height: 1.05;
+        }
+
+        .brand-subtitle {
+            margin-top: 5px;
+            color: #667b6f;
+            font-size: 9px;
+            font-weight: 700;
+            letter-spacing: 1px;
+        }
+
+        .sidebar-section-title {
+            margin: 22px 8px 9px;
+            color: #61766a;
+            direction: rtl;
+            text-align: right;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+        }
+
+        .sidebar-info {
+            margin: 18px 4px 0;
+            padding: 15px;
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.025);
+            color: #81958a;
+            direction: rtl;
+            text-align: right;
+            font-size: 11px;
+            line-height: 1.9;
+        }
+
+        .sidebar-info strong {
+            color: #d8e9df;
+        }
+
+        /* ---------------- Buttons ---------------- */
+
+        .stButton > button {
+            min-height: 42px;
+            border: 1px solid var(--border) !important;
+            border-radius: 12px !important;
+            background: rgba(255, 255, 255, 0.025) !important;
+            color: #b8c9c0 !important;
+            font-family: "Cairo", sans-serif !important;
+            font-size: 12px !important;
+            font-weight: 600 !important;
+            transition:
+                transform 0.18s ease,
+                background 0.18s ease,
+                border-color 0.18s ease;
+        }
+
+        .stButton > button:hover {
+            transform: translateY(-1px);
+            border-color: var(--border-green) !important;
+            background: rgba(32, 199, 120, 0.08) !important;
+            color: #ffffff !important;
+        }
+
+        .primary-button .stButton > button {
+            border: 0 !important;
+            color: #ffffff !important;
+            background:
+                linear-gradient(
+                    135deg,
+                    #1ebc72 0%,
+                    #087542 100%
+                ) !important;
+            box-shadow:
+                0 10px 25px rgba(21, 169, 96, 0.18);
+        }
+
+        /* ---------------- Header ---------------- */
+
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            direction: rtl;
+            margin-bottom: 8px;
+        }
+
+        .agent-profile {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            direction: ltr;
+        }
+
+        .agent-avatar {
+            width: 48px;
+            height: 48px;
+            flex: 0 0 48px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 15px;
+            background:
+                linear-gradient(145deg, #1fc577, #087542);
+            box-shadow:
+                0 10px 28px rgba(0, 0, 0, 0.25);
+            font-size: 23px;
+        }
+
+        .agent-name {
+            color: #ffffff;
+            direction: rtl;
+            text-align: right;
+            font-size: 17px;
+            font-weight: 800;
+            line-height: 1.1;
+        }
+
+        .agent-role {
+            margin-top: 4px;
+            color: var(--muted);
+            direction: rtl;
+            text-align: right;
+            font-size: 10px;
+        }
+
+        .online-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 7px 11px;
+            border: 1px solid rgba(32, 199, 120, 0.16);
+            border-radius: 999px;
+            background: rgba(32, 199, 120, 0.06);
+            color: #70d99f;
+            font-size: 10px;
+            font-weight: 600;
+            direction: rtl;
+        }
+
+        .online-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #2bd77e;
+            box-shadow: 0 0 10px rgba(43, 215, 126, 0.7);
+        }
+
+        /* ---------------- Welcome ---------------- */
+
+        .hero {
+            max-width: 780px;
+            margin: 0 auto;
+            padding: 55px 12px 25px;
+            direction: rtl;
+            text-align: center;
+        }
+
+        .hero-icon {
+            width: 82px;
+            height: 82px;
+            margin: 0 auto 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 25px;
+            background:
+                radial-gradient(
+                    circle at 30% 20%,
+                    #36d987,
+                    #087542 72%
+                );
+            box-shadow:
+                0 20px 50px rgba(0, 0, 0, 0.32),
+                0 0 55px rgba(31, 196, 116, 0.08);
+            font-size: 38px;
+        }
+
+        .hero h1 {
+            margin: 0;
+            color: #ffffff;
+            font-size: clamp(27px, 4vw, 35px);
+            font-weight: 800;
+            letter-spacing: -0.4px;
+        }
+
+        .hero p {
+            max-width: 650px;
+            margin: 10px auto 0;
+            color: #81958a;
+            font-size: 13px;
+            line-height: 2;
+        }
+
+        .hero-highlight {
+            color: #43d88c;
+            font-weight: 800;
+        }
+
+        .quick-title {
+            margin: 12px 2px 9px;
+            color: #61766a;
+            direction: rtl;
+            text-align: right;
+            font-size: 10px;
+            font-weight: 700;
+        }
+
+        /* ---------------- Chat ---------------- */
+
+        .chat-shell {
+            margin-top: 14px;
+            direction: rtl;
+        }
+
+        [data-testid="stChatMessage"] {
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            background: rgba(10, 25, 17, 0.62);
+            box-shadow: 0 8px 28px rgba(0, 0, 0, 0.10);
+        }
+
+        [data-testid="stChatMessage"]:has(
+            [data-testid="chatAvatarIcon-user"]
+        ) {
+            background: rgba(17, 32, 25, 0.72);
+        }
+
+        [data-testid="stChatMessage"] p,
+        [data-testid="stChatMessage"] li {
+            direction: rtl;
+            text-align: right;
+            color: #e3eee8;
+            font-size: 13px;
+            line-height: 2;
+        }
+
+        [data-testid="stChatMessage"] ul,
+        [data-testid="stChatMessage"] ol {
+            direction: rtl;
+            text-align: right;
+        }
+
+        /* ---------------- Chat input ---------------- */
+
+        div[data-testid="stChatInput"] {
+            direction: rtl;
+        }
+
+        div[data-testid="stChatInput"] textarea {
+            min-height: 56px !important;
+            border: 1px solid rgba(255, 255, 255, 0.08) !important;
+            border-radius: 18px !important;
+            background: rgba(10, 24, 16, 0.96) !important;
+            color: #f0f8f3 !important;
+            font-family: "Cairo", sans-serif !important;
+            font-size: 13px !important;
+            line-height: 1.7 !important;
+            box-shadow: var(--shadow);
+        }
+
+        div[data-testid="stChatInput"] textarea::placeholder {
+            color: #607469 !important;
+        }
+
+        div[data-testid="stChatInput"] textarea:focus {
+            border-color: rgba(32, 199, 120, 0.42) !important;
+            box-shadow:
+                0 0 0 1px rgba(32, 199, 120, 0.12),
+                var(--shadow) !important;
+        }
+
+        /* ---------------- Thinking ---------------- */
+
+        .thinking {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            width: fit-content;
+            margin: 10px 0;
+            padding: 9px 13px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.025);
+            color: #7d9286;
+            direction: rtl;
+            font-size: 10px;
+        }
+
+        .thinking-dots {
+            display: inline-flex;
+            gap: 4px;
+        }
+
+        .thinking-dots span {
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: #2bd77e;
+            animation: pulse 1.1s infinite ease-in-out;
+        }
+
+        .thinking-dots span:nth-child(2) {
+            animation-delay: 0.15s;
+        }
+
+        .thinking-dots span:nth-child(3) {
+            animation-delay: 0.3s;
+        }
+
+        @keyframes pulse {
+            0%,
+            100% {
+                opacity: 0.25;
+                transform: translateY(0);
+            }
+
+            50% {
+                opacity: 1;
+                transform: translateY(-2px);
+            }
+        }
+
+        /* ---------------- Footer ---------------- */
+
+        .footer {
+            margin-top: 35px;
+            padding: 10px;
+            color: #3e5147;
+            direction: rtl;
+            text-align: center;
+            font-size: 9px;
+        }
+
+        /* ---------------- Mobile ---------------- */
+
+        @media (max-width: 768px) {
+            .block-container {
+                padding: 0.8rem 10px 6rem;
+            }
+
+            .online-pill {
+                display: none;
+            }
+
+            .agent-avatar {
+                width: 43px;
+                height: 43px;
+                flex-basis: 43px;
+            }
+
+            .agent-name {
+                font-size: 15px;
+            }
+
+            .hero {
+                padding-top: 32px;
+            }
+
+            .hero-icon {
+                width: 70px;
+                height: 70px;
+                border-radius: 21px;
+                font-size: 31px;
+            }
+
+            .hero p {
+                font-size: 12px;
+            }
+
+            [data-testid="stChatMessage"] {
+                border-radius: 15px;
+            }
+
+            [data-testid="stChatMessage"] p,
+            [data-testid="stChatMessage"] li {
+                font-size: 12px;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# UI components
+# ============================================================
+
+QUICK_QUESTIONS: List[str] = [
+    "مين بيلعب دلوقتي؟",
+    "ماتش الأهلي الجاي إمتى؟",
+    "آخر أخبار الزمالك إيه؟",
+    "حللّي آخر ماتش لليفربول",
+]
+
+
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.markdown(
+            """
+            <div class="brand">
+                <div class="brand-logo">⚽</div>
+                <div>
+                    <div class="brand-title">TRIVIO</div>
+                    <div class="brand-subtitle">FOOTBALL AI AGENT</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown('<div class="primary-button">', unsafe_allow_html=True)
+        if st.button(
+            "＋  محادثة جديدة",
+            use_container_width=True,
+            key="new_chat",
+        ):
+            reset_conversation()
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown(
+            '<div class="sidebar-section-title">اسأل عم مجدي</div>',
+            unsafe_allow_html=True,
+        )
+
+        for index, question in enumerate(QUICK_QUESTIONS):
+            if st.button(
+                question,
+                use_container_width=True,
+                key=f"sidebar_question_{index}",
+            ):
+                queue_question(question)
+
+        st.markdown(
+            """
+            <div class="sidebar-info">
+                <strong>عم مجدي</strong><br>
+                صاحبك اللي بيحب الكورة وبيتابعها من زمان.
+                اسأله عن المواعيد، النتائج، المباريات المباشرة،
+                الأخبار أو تحليل الماتشات.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            """
+            <div class="sidebar-info">
+                <strong>💡 نصيحة</strong><br>
+                كل ما كان سؤالك محدد أكتر، عم مجدي يقدر
+                يساعدك بإجابة أدق.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_header() -> None:
+    st.markdown(
+        """
+        <div class="topbar">
+            <div class="agent-profile">
+                <div class="agent-avatar">👴</div>
+                <div>
+                    <div class="agent-name">عم مجدي</div>
+                    <div class="agent-role">
+                        قاعدلك على القهوة · Football AI
+                    </div>
+                </div>
+            </div>
+
+            <div class="online-pill">
+                <span class="online-dot"></span>
+                متصل بالسيرفر
+            </div>
         </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+        """,
+        unsafe_allow_html=True,
+    )
 
-def render_sidebar():
-with st.sidebar:
-st.markdown(
-"""
-<div class="sidebar-brand">
-<div class="sidebar-logo">⚽</div>
-<div class="sidebar-brand-text">
-<div class="sidebar-brand-title">TRIVIO</div>
-<div class="sidebar-brand-subtitle">FOOTBALL AI AGENT</div>
-</div>
-</div>
-""",
-unsafe_allow_html=True,
-)
 
-    st.markdown('<div class="new-chat">', unsafe_allow_html=True)
-    if st.button("＋  محادثة جديدة", use_container_width=True):
-        reset_conversation()
-        st.rerun()
+def render_welcome() -> None:
+    st.markdown(
+        """
+        <section class="hero">
+            <div class="hero-icon">⚽</div>
+            <h1>قولّي يا كابتن 👋</h1>
+            <p>
+                أنا <span class="hero-highlight">عم مجدي</span>،
+                صاحبك اللي فاهم الكورة من زمان.
+                عايز تعرف ماتش، نتيجة، ميعاد، خبر،
+                أو نفصص ماتش ونشوف حصل فيه إيه؟
+                <br>
+                <strong>قول بس وأنا معاك.</strong>
+            </p>
+        </section>
+
+        <div class="quick-title">أمثلة تقدر تبدأ بيها</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col1, col2 = st.columns(2, gap="small")
+
+    for index, question in enumerate(QUICK_QUESTIONS):
+        column = col1 if index % 2 == 0 else col2
+
+        with column:
+            if st.button(
+                question,
+                use_container_width=True,
+                key=f"hero_question_{index}",
+            ):
+                queue_question(question)
+
+
+def render_chat() -> None:
+    """Render conversation using Streamlit's native chat components."""
+    st.markdown('<div class="chat-shell">', unsafe_allow_html=True)
+
+    for message in st.session_state.messages:
+        role = message["role"]
+        avatar = "👤" if role == "user" else "👴"
+
+        with st.chat_message(role, avatar=avatar):
+            st.markdown(message["content"])
+
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown('<div class="sidebar-label">اسأل عم مجدي</div>', unsafe_allow_html=True)
 
-    questions = [
-        "مين بيلعب دلوقتي؟",
-        "ماتش الأهلي الجاي إمتى؟",
-        "آخر أخبار الزمالك إيه؟",
-        "حللّي آخر ماتش لليفربول",
-    ]
+def render_thinking() -> Any:
+    placeholder = st.empty()
 
-    for i, q in enumerate(questions):
-        if st.button(q, key=f"sq_{i}", use_container_width=True):
-            st.session_state.pending_question = q
-            st.rerun()
+    placeholder.markdown(
+        """
+        <div class="thinking">
+            <div class="thinking-dots">
+                <span></span>
+                <span></span>
+                <span></span>
+            </div>
+            عم مجدي بيفكر في الموضوع...
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    return placeholder
+
+
+# ============================================================
+# Message handling
+# ============================================================
+
+def get_error_message(error: Exception) -> str:
+    """Convert technical exceptions into friendly Arabic messages."""
+    if isinstance(error, requests.exceptions.Timeout):
+        return (
+            "بص يا كابتن، السيرفر اتأخر شوية في الرد. "
+            "جرّب السؤال تاني بعد لحظة."
+        )
+
+    if isinstance(error, requests.exceptions.ConnectionError):
+        return (
+            "يا نجم، مش قادر أوصل للسيرفر دلوقتي. "
+            "اتأكد إن الـ API شغال وجرب تاني."
+        )
+
+    if isinstance(error, requests.exceptions.HTTPError):
+        status_code = getattr(
+            getattr(error, "response", None),
+            "status_code",
+            None,
+        )
+
+        if status_code == 429:
+            return (
+                "الطلبات كتير على السيرفر دلوقتي. "
+                "استنى لحظة وجرب تاني."
+            )
+
+        if status_code and status_code >= 500:
+            return (
+                "السيرفر نفسه واجه مشكلة مؤقتة. "
+                "جرّب تاني بعد شوية يا كابتن."
+            )
+
+        return (
+            "حصلت مشكلة أثناء الاتصال بالخدمة. "
+            "جرّب السؤال تاني."
+        )
+
+    return (
+        "حصلت مشكلة تقنية وأنا بكلم السيستم. "
+        "جرّب السؤال تاني يا نجم."
+    )
+
+
+def process_message(prompt: str) -> None:
+    """Append the user message, call the agent, and render the response."""
+    prompt = prompt.strip()
+
+    if not prompt:
+        return
+
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": prompt,
+        }
+    )
+
+    with st.chat_message("user", avatar="👤"):
+        st.markdown(prompt)
+
+    thinking = render_thinking()
+
+    try:
+        response_text = ask_backend(
+            st.session_state.session_id,
+            prompt,
+        )
+
+        if not response_text:
+            response_text = (
+                "مش لاقي رد مناسب دلوقتي يا كابتن. "
+                "جرّب تسألني بطريقة تانية."
+            )
+
+    except Exception as exc:
+        logger.exception("Backend request failed")
+        response_text = get_error_message(exc)
+
+    finally:
+        thinking.empty()
+
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": response_text,
+        }
+    )
+
+    with st.chat_message("assistant", avatar="👴"):
+        st.markdown(response_text)
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main() -> None:
+    initialize_state()
+    inject_css()
+    render_sidebar()
+    render_header()
+
+    if st.session_state.messages:
+        render_chat()
+    else:
+        render_welcome()
+
+    user_input = st.chat_input(
+        "قول لعم مجدي عايز تعرف إيه... ⚽"
+    )
+
+    pending_question = st.session_state.pending_question
+
+    if pending_question:
+        st.session_state.pending_question = None
+
+    active_prompt = pending_question or user_input
+
+    if active_prompt:
+        process_message(active_prompt)
 
     st.markdown(
         """
-        <div class="sidebar-description">
-            <strong>عم مجدي (v1.0)</strong><br>
-            وكيل ذكاء اصطناعي (AI Agent) مبني لتحليل البيانات الكروية، الأخبار، والمباريات المباشرة بدقة عالية.
+        <div class="footer">
+            Trivio · عم مجدي · Egyptian Football AI
+            <br>
+            Built with FastAPI + LangGraph
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-def render_header():
-st.markdown(
-"""
-<div class="topbar">
-<div class="profile">
-<div class="profile-avatar">👴</div>
-<div class="profile-info">
-<div class="profile-name">عم مجدي</div>
-<div class="profile-role">قاعدلك على القهوة ⚽</div>
-</div>
-</div>
-<div class="status"><span class="status-dot"></span> متصل بالسيرفر</div>
-</div>
-""",
-unsafe_allow_html=True,
-)
 
-def render_welcome_dashboard():
-st.markdown(
-"""
-<div class="welcome">
-<div class="welcome-icon">⚽</div>
-<h1>قولّي يا كابتن 👋</h1>
-<p>أنا <span style="color: #43ce88; font-weight: 700;">عم مجدي</span>، قاعدلك أهو. عايز تعرف ماتش، نتيجة، خبر، ميعاد، ولا نفصص ماتش ونشوف حصل فيه إيه؟ قول بس وأنا معاك.</p>
-</div>
-<div class="quick-heading">أمثلة للأسئلة المتاحة</div>
-""",
-unsafe_allow_html=True,
-)
-
-prompts = [
-    ("🔴", "مين بيلعب دلوقتي؟"),
-    ("📅", "ماتش الأهلي الجاي إمتى؟"),
-    ("📰", "آخر أخبار الزمالك إيه؟"),
-    ("⚽", "حللّي آخر ماتش لليفربول"),
-]
-
-col1, col2 = st.columns(2, gap="small")
-for i, (icon, text) in enumerate(prompts):
-    with (col1 if i % 2 == 0 else col2):
-        if st.button(f"{icon}  {text}", key=f"q_{i}", use_container_width=True):
-            st.session_state.pending_question = text
-            st.rerun()
-
-def main():
-initialize_session()
-inject_custom_css()
-
-render_sidebar()
-render_header()
-
-if not st.session_state.messages:
-    render_welcome_dashboard()
-else:
-    st.markdown('<div class="chat-area">', unsafe_allow_html=True)
-    for msg in st.session_state.messages:
-        render_message(msg["role"], msg["content"])
-    st.markdown("</div>", unsafe_allow_html=True)
-
-user_input = st.chat_input("قول لعم مجدي عايز تعرف إيه...")
-active_prompt = st.session_state.pending_question or user_input
-
-if st.session_state.pending_question:
-    st.session_state.pending_question = None
-
-if active_prompt and active_prompt.strip():
-    prompt_text = active_prompt.strip()
-    
-    st.session_state.messages.append({"role": "user", "content": prompt_text})
-    render_message("user", prompt_text)
-
-    thinking_ui = st.empty()
-    thinking_ui.markdown(
-        """
-        <div class="thinking">
-            <div class="thinking-dot"></div>
-            <span>عم مجدي بيفكر في خطة اللعب...</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    try:
-        response_text = ask_backend(st.session_state.session_id, prompt_text)
-        
-        thinking_ui.empty()
-        st.session_state.messages.append({"role": "assistant", "content": response_text})
-        render_message("assistant", response_text)
-
-    except requests.exceptions.ConnectionError:
-        thinking_ui.empty()
-        error_msg = "يا نجم، مش قادر أوصل للسيرفر دلوقتي. اتأكد إن الـ API شغال وجرب تاني."
-        st.session_state.messages.append({"role": "assistant", "content": error_msg})
-        render_message("assistant", error_msg)
-        logger.error("Connection Error to Backend.")
-        
-    except requests.exceptions.Timeout:
-        thinking_ui.empty()
-        error_msg = "بص يا كابتن، السيرفر خد وقت أطول من اللازم. الشبكة تقيلة شوية، جرب تسألني تاني."
-        st.session_state.messages.append({"role": "assistant", "content": error_msg})
-        render_message("assistant", error_msg)
-        logger.error("Timeout Error to Backend.")
-        
-    except Exception as e:
-        thinking_ui.empty()
-        error_msg = "حصلت مشكلة تقنية وأنا بكلم السيستم. جرب سؤال تاني يا نجم."
-        st.session_state.messages.append({"role": "assistant", "content": error_msg})
-        render_message("assistant", error_msg)
-        logger.exception(f"Unexpected Backend Error: {e}")
-
-st.markdown(
-    '<div class="app-footer">Trivio Architecture · Powered by Multi-Agent AI · Engineered for Scale</div>',
-    unsafe_allow_html=True
-)
-
-if name == "main":
+if __name__ == "__main__":
+    main()
