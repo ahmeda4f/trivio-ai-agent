@@ -46,7 +46,6 @@ def get_chat_endpoint() -> str:
         if endpoint:
             return str(endpoint).strip()
     except Exception:
-        # No secrets file is a valid local-development state.
         pass
 
     return os.getenv("CHAT_ENDPOINT", "").strip()
@@ -753,10 +752,7 @@ def render_header() -> None:
                 </div>
             </div>
 
-            <div class="online-pill">
-                <span class="online-dot"></span>
-                متصل بالسيرفر
-            </div>
+            
         </div>
         """,
         unsafe_allow_html=True,
